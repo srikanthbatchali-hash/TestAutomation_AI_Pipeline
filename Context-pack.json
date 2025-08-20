@@ -1,335 +1,91 @@
 {
-  "schema": "yourorg.context-pack",
-  "version": "1.1.0",
-  "meta": {
-    "project": "loan-processing-app",
-    "appKey": "app1",
-    "generatedAt": "2025-08-20T16:40:00Z",
-    "artifacts": [
-      ".qa-cache/composites.learned.json",
-      ".qa-cache/nav-edges.learned.yaml",
-      ".qa-cache/composite-steps.index.json",
-      ".qa-cache/base-steps.index.json",
-      ".qa-cache/base-scenarios.index.json",
-      ".qa-cache/scenario-calls.index.json"
-    ]
-  },
   "jira": {
-    "key": "ABC-456",
-    "title": "Kid Loan: capture child details and guardian consent",
-    "summary": "For Kid Loans, collect child name and DOB, capture guardian consent, and save relationship to applicant.",
+    "id": "LOAN-123",
+    "title": "Add kid loan section to Loan Details",
     "acceptanceCriteria": [
-      "When loan type is Kid Loan, Kid Loan section becomes available on Loan Details.",
-      "Kid Loan section requires: Child Name, Child DOB, Guardian Consent (checkbox), Relationship (dropdown).",
-      "DOB must be a past date; future date should show validation error.",
-      "On Save, values persist and a confirmation banner is shown: \"Kid loan saved\"."
-    ],
-    "notes": ["Role: backoffice", "Affects loans created in last 30 days"]
-  },
-  "intent": {
-    "target": "KidLoanSection",
-    "explicitHints": [
-      "kid loan",
-      "child",
-      "guardian",
-      "relationship",
-      "consent"
+      "When user navigates to Loan Details, they see a new Kid Loan tab",
+      "Kid Loan section must accept child name, DOB, guardian consent, and relationship",
+      "DOB cannot be in the future; system must reject with error",
+      "Saved kid loan details are persisted and visible in subsequent login"
     ]
   },
   "grounding": {
+    "canonical_base_steps": [
+      "user inputs {value} in {control}",
+      "user clicks {control}",
+      "user sees text {value}",
+      "user validates {page}",
+      "user selects {value} in {control}",
+      "user checks {control}"
+    ],
     "allowed_terms": [
-      "LoginPage",
-      "HomePage",
-      "LoanDetailsPage",
       "KidLoanSection",
-      "kidLoan.tab",
       "childName.input",
       "childDob.input",
       "guardianConsent.checkbox",
       "relationship.select",
       "save.button",
       "validation.error",
-      "Kid loan saved"
+      "banner"
     ],
-    "allowed_verbs": [
-      "open",
-      "click",
-      "select",
-      "input",
-      "validate",
-      "save",
-      "see",
-      "check",
-      "uncheck"
-    ],
-    "canonical_base_steps": [
-      {
-        "name": "click",
-        "text": "Then user clicks \"{control}\"",
-        "params": ["control"]
-      },
-      {
-        "name": "select",
-        "text": "Then user selects \"{value}\" in \"{control}\"",
-        "params": ["value", "control"]
-      },
-      {
-        "name": "input",
-        "text": "Then user inputs \"{value}\" in \"{control}\"",
-        "params": ["value", "control"]
-      },
-      {
-        "name": "validate_page",
-        "text": "Then user validates \"{page}\" page",
-        "params": ["page"]
-      },
-      {
-        "name": "check",
-        "text": "Then user checks \"{control}\"",
-        "params": ["control"]
-      },
-      {
-        "name": "banner_contains",
-        "text": "Then banner shows \"{text}\"",
-        "params": ["text"]
-      },
-      {
-        "name": "see_text",
-        "text": "Then user sees text \"{text}\"",
-        "params": ["text"]
-      }
-    ],
-    "data_dictionary": {
-      "child_name": { "type": "string", "minLength": 2, "maxLength": 80 },
-      "child_dob": {
-        "type": "string",
-        "format": "date",
-        "description": "YYYY-MM-DD, must be past date"
-      },
-      "guardian_consent": { "type": "boolean" },
-      "relationship": { "enum": ["Parent", "Guardian", "Relative"] },
-      "loan_id": { "type": "string", "format": "id" }
-    },
-    "style": {
-      "step_format": "Verb + object using allowed terms only.",
-      "forbid": ["assume", "maybe", "navigate vaguely", "guess"],
-      "require_exact_terms": true
-    }
+    "allowed_verbs": ["click", "input", "check", "select", "validate", "see"]
   },
   "plan": {
-    "id": "plan-kidloan-01",
-    "target": "KidLoanSection",
-    "path": [
-      { "from": "LoginPage", "to": "HomePage" },
-      { "from": "HomePage", "to": "LoanDetailsPage" },
-      { "from": "LoanDetailsPage", "to": "KidLoanSection" }
-    ],
     "composites": [
+      { "id": "login", "invoke": "user performs \"login\"" },
       {
-        "invoke": "Given user performs \"login\"",
-        "evidence": ["features/auth/login.feature:3"]
+        "id": "navigateLoanDetails",
+        "invoke": "user performs \"navigate to loan details\""
       },
+      { "id": "openKidLoanSection", "invoke": "user clicks \"kidLoan.tab\"" },
       {
-        "invoke": "Given user performs \"navigate to loan details\"",
-        "evidence": ["features/loans/check_loan.feature:5"]
+        "id": "validateKidLoanSection",
+        "invoke": "user validates \"KidLoanSection\" page"
       }
     ],
     "last_mile": [
       {
-        "schema": "yourorg.last-mile",
-        "version": "1.0.0",
-        "from": "LoanDetailsPage",
-        "to": "KidLoanSection",
-        "intent": "open-section",
-        "mode": "probe",
-        "candidates": [
-          {
-            "kind": "control",
-            "hint": "kidLoan.tab",
-            "locator": { "orKey": "kidLoan.tab" }
-          },
-          { "kind": "text", "hint": "Kid Loan" }
-        ],
-        "assert": {
-          "page": "KidLoanSection",
-          "orFallback": { "text": "Kid Loan" }
-        },
-        "derivedManual": {
-          "bullets": ["Open Kid Loan section", "Validate section visible"]
-        },
+        "id": "fillKidLoan",
         "baseStepMapping": [
           {
-            "manual": "Open Kid Loan section",
-            "intent": "nav.click",
-            "targetHint": "kidLoan.tab",
             "candidates": [
               {
-                "baseStepText": "Then user clicks \"{control}\"",
-                "params": ["control"],
-                "binding": { "control": "kidLoan.tab" },
-                "confidence": 0.92,
-                "evidence": ["features/common/clicks.feature:6"]
-              }
-            ]
-          },
-          {
-            "manual": "Validate section visible",
-            "intent": "assert.visible",
-            "targetHint": "KidLoanSection",
-            "candidates": [
+                "baseStepText": "user inputs {value} in {control}",
+                "binding": {
+                  "value": "<child_name>",
+                  "control": "childName.input"
+                }
+              },
               {
-                "baseStepText": "Then user validates \"{page}\" page",
-                "params": ["page"],
-                "binding": { "page": "KidLoanSection" },
-                "confidence": 0.88,
-                "evidence": ["features/common/validate_page.feature:4"]
+                "baseStepText": "user inputs {value} in {control}",
+                "binding": {
+                  "value": "<child_dob>",
+                  "control": "childDob.input"
+                }
+              },
+              {
+                "baseStepText": "user checks {control}",
+                "binding": { "control": "guardianConsent.checkbox" }
+              },
+              {
+                "baseStepText": "user selects {value} in {control}",
+                "binding": {
+                  "value": "<relationship>",
+                  "control": "relationship.select"
+                }
               }
             ]
           }
         ]
       },
       {
-        "schema": "yourorg.last-mile",
-        "version": "1.0.0",
-        "from": "KidLoanSection",
-        "to": "KidLoanSection",
-        "intent": "fill-and-save",
-        "mode": "manual",
-        "candidates": [
-          { "kind": "control", "hint": "childName.input" },
-          { "kind": "control", "hint": "childDob.input" },
-          { "kind": "control", "hint": "guardianConsent.checkbox" },
-          { "kind": "control", "hint": "relationship.select" },
-          { "kind": "control", "hint": "save.button" }
-        ],
-        "assert": { "page": "KidLoanSection" },
-        "data": {
-          "child_name": "<child_name>",
-          "child_dob": "<child_dob>",
-          "guardian_consent": "<true|false>",
-          "relationship": "<Parent|Guardian|Relative>"
-        },
-        "examples": [
-          {
-            "child_name": "Alex Kim",
-            "child_dob": "2012-06-01",
-            "guardian_consent": true,
-            "relationship": "Parent"
-          },
-          {
-            "child_name": "Sam Lee",
-            "child_dob": "2030-01-01",
-            "guardian_consent": true,
-            "relationship": "Guardian"
-          },
-          {
-            "child_name": "Mia Roy",
-            "child_dob": "2015-03-15",
-            "guardian_consent": false,
-            "relationship": "Relative"
-          }
-        ],
-        "derivedManual": {
-          "bullets": [
-            "Input child name",
-            "Input child dob",
-            "Check guardian consent",
-            "Select relationship",
-            "Click save",
-            "Validate banner"
-          ]
-        },
+        "id": "saveKidLoan",
         "baseStepMapping": [
           {
-            "manual": "Input child name",
-            "intent": "type.set",
-            "targetHint": "childName.input",
             "candidates": [
               {
-                "baseStepText": "Then user inputs \"{value}\" in \"{control}\"",
-                "params": ["value", "control"],
-                "binding": {
-                  "value": "<child_name>",
-                  "control": "childName.input"
-                },
-                "confidence": 0.96,
-                "evidence": ["features/common/input.feature:5"]
-              }
-            ]
-          },
-          {
-            "manual": "Input child dob",
-            "intent": "type.set",
-            "targetHint": "childDob.input",
-            "candidates": [
-              {
-                "baseStepText": "Then user inputs \"{value}\" in \"{control}\"",
-                "params": ["value", "control"],
-                "binding": {
-                  "value": "<child_dob>",
-                  "control": "childDob.input"
-                },
-                "confidence": 0.95,
-                "evidence": ["features/common/input.feature:5"]
-              }
-            ]
-          },
-          {
-            "manual": "Check guardian consent",
-            "intent": "click.check",
-            "targetHint": "guardianConsent.checkbox",
-            "candidates": [
-              {
-                "baseStepText": "Then user checks \"{control}\"",
-                "params": ["control"],
-                "binding": { "control": "guardianConsent.checkbox" },
-                "confidence": 0.94,
-                "evidence": ["features/common/check.feature:4"]
-              }
-            ]
-          },
-          {
-            "manual": "Select relationship",
-            "intent": "nav.select",
-            "targetHint": "relationship.select",
-            "candidates": [
-              {
-                "baseStepText": "Then user selects \"{value}\" in \"{control}\"",
-                "params": ["value", "control"],
-                "binding": {
-                  "value": "<relationship>",
-                  "control": "relationship.select"
-                },
-                "confidence": 0.95,
-                "evidence": ["features/common/select.feature:8"]
-              }
-            ]
-          },
-          {
-            "manual": "Click save",
-            "intent": "nav.click",
-            "targetHint": "save.button",
-            "candidates": [
-              {
-                "baseStepText": "Then user clicks \"{control}\"",
-                "params": ["control"],
-                "binding": { "control": "save.button" },
-                "confidence": 0.93,
-                "evidence": ["features/common/clicks.feature:6"]
-              }
-            ]
-          },
-          {
-            "manual": "Validate banner",
-            "intent": "assert.banner",
-            "targetHint": "Kid loan saved",
-            "candidates": [
-              {
-                "baseStepText": "Then banner shows \"{text}\"",
-                "params": ["text"],
-                "binding": { "text": "Kid loan saved" },
-                "confidence": 0.92,
-                "evidence": ["features/common/banner.feature:3"]
+                "baseStepText": "user clicks {control}",
+                "binding": { "control": "save.button" }
               }
             ]
           }
@@ -338,102 +94,78 @@
     ],
     "validations": [
       {
-        "type": "ui.banner",
-        "textContains": "Kid loan saved",
-        "severity": "must",
-        "baseStep": {
-          "name": "banner_contains",
-          "text": "Then banner shows \"{text}\"",
-          "binding": { "text": "Kid loan saved" }
-        }
+        "id": "validateSavedKidLoan",
+        "candidates": [
+          {
+            "baseStepText": "user sees text {value}",
+            "binding": { "value": "Kid loan saved" }
+          }
+        ]
       },
       {
-        "type": "db.check",
-        "table": "KID_LOAN",
-        "where": { "loanId": "<loan_id>" },
-        "expect": {
-          "childName": "<child_name>",
-          "relationship": "<relationship>",
-          "guardianConsent": "<guardian_consent>"
-        },
-        "severity": "should"
+        "id": "validateInvalidDOB",
+        "candidates": [
+          {
+            "baseStepText": "user sees text {value}",
+            "binding": { "value": "validation.error" }
+          }
+        ]
       }
-    ],
-    "dataBindings": { "role": "backoffice", "loan_id": "<existing_loan_id>" }
+    ]
   },
   "manual_tests": {
     "tests": [
       {
-        "name": "Kid Loan happy path",
+        "scenarioName": "Add kid loan with valid DOB",
         "steps": [
-          "open Kid Loan section on LoanDetailsPage",
-          "input child name",
-          "input child dob",
-          "check guardian consent",
-          "select relationship",
-          "save",
-          "see confirmation banner"
+          "Login as existing user",
+          "Open loan details",
+          "Navigate to Kid Loan tab",
+          "Enter child name and DOB",
+          "Check consent and select relationship",
+          "Save the details",
+          "Verify saved loan shows up"
         ],
-        "expected": "Banner shows Kid loan saved; values persist",
-        "traceToAC": [1, 4]
+        "examples": [
+          {
+            "child_name": "Alex Kim",
+            "child_dob": "2012-06-01",
+            "guardian_consent": true,
+            "relationship": "Parent"
+          }
+        ],
+        "traceToAC": [1, 2, 4]
       },
       {
-        "name": "DOB future date validation",
-        "steps": ["open Kid Loan section", "input future child dob", "save"],
-        "expected": "Validation error appears for DOB (must be past date)",
+        "scenarioName": "Reject invalid future DOB",
+        "steps": [
+          "Login as existing user",
+          "Open loan details",
+          "Navigate to Kid Loan tab",
+          "Enter future DOB",
+          "Save the details",
+          "Verify validation error is shown"
+        ],
+        "examples": [
+          {
+            "child_name": "Sam Lee",
+            "child_dob": "2030-01-01",
+            "guardian_consent": true,
+            "relationship": "Guardian"
+          }
+        ],
         "traceToAC": [3]
-      },
-      {
-        "name": "Guardian consent required",
-        "steps": ["open Kid Loan section", "uncheck guardian consent", "save"],
-        "expected": "Validation error for missing guardian consent",
-        "traceToAC": [2]
-      },
-      {
-        "name": "Relationship required",
-        "steps": ["open Kid Loan section", "leave relationship empty", "save"],
-        "expected": "Validation error for missing relationship",
-        "traceToAC": [2]
       }
     ]
   },
-  "automationDraft": {
-    "feature": "Kid Loan section on Loan Details",
-    "scenarioName": "Capture kid loan details with validations",
-    "steps": [
-      "Given user performs \"login\"",
-      "And user performs \"navigate to loan details\"",
-      "Then user clicks \"kidLoan.tab\"",
-      "Then user validates \"KidLoanSection\" page",
-      "Then user inputs \"<child_name>\" in \"childName.input\"",
-      "Then user inputs \"<child_dob>\" in \"childDob.input\"",
-      "Then user checks \"guardianConsent.checkbox\"",
-      "Then user selects \"<relationship>\" in \"relationship.select\"",
-      "Then user clicks \"save.button\"",
-      "Then banner shows \"Kid loan saved\""
-    ],
-    "examples": [
-      {
-        "child_name": "Alex Kim",
-        "child_dob": "2012-06-01",
-        "guardian_consent": true,
-        "relationship": "Parent",
-        "loan_id": "<existing_loan_id>"
-      },
-      {
-        "child_name": "Sam Lee",
-        "child_dob": "2030-01-01",
-        "guardian_consent": true,
-        "relationship": "Guardian",
-        "loan_id": "<existing_loan_id>"
-      },
-      {
-        "child_name": "Mia Roy",
-        "child_dob": "2015-03-15",
-        "guardian_consent": false,
-        "relationship": "Relative",
-        "loan_id": "<existing_loan_id>"
-      }
-    ]
+  "authoring_policy": {
+    "forbidVerbatimFromDraft": true,
+    "minChangesFromDraft": 3,
+    "requireGapCoverage": true,
+    "requireNegativeCase": true,
+    "variants": 2
+  },
+  "evidence": {
+    "hints": {}
   }
 }
