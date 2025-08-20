@@ -1,0 +1,159 @@
+{
+  "schema": "yourorg.context-pack",
+  "version": "1.0.1",
+  "meta": {
+    "project": "loan-processing-app",
+    "appKey": "app1",
+    "generatedAt": "2025-08-20T15:55:00Z",
+    "artifacts": [
+      ".qa-cache/composites.learned.json",
+      ".qa-cache/nav-edges.learned.yaml",
+      ".qa-cache/composite-steps.index.json",
+      ".qa-cache/base-steps.index.json",
+      ".qa-cache/base-scenarios.index.json",
+      ".qa-cache/scenario-calls.index.json"
+    ]
+  },
+
+  "jira": {
+    "key": "ABC-123",
+    "title": "Add Disposition to Loan",
+    "summary": "When a user opens Loan Details they can set a Disposition (APPROVE/DECLINE/REVIEW) and see the Disposition modal with reason input.",
+    "acceptanceCriteria": [
+      "Given a valid loan, when Disposition is set to APPROVE, then Disposition modal opens.",
+      "Modal shows fields: code, reason (required).",
+      "Saving persists disposition and shows confirmation banner."
+    ],
+    "notes": ["Role: backoffice", "Affects loans created in last 30 days"]
+  },
+
+  "intent": {
+    "target": "DispositionModal",
+    "explicitHints": ["loan", "disposition", "modal", "approve"]
+  },
+
+  "plan": {
+    "id": "plan-abc123-01",
+    "target": "DispositionModal",
+    "path": [
+      { "from": "LoginPage", "to": "HomePage" },
+      { "from": "HomePage", "to": "LoanDetailsPage" },
+      { "from": "LoanDetailsPage", "to": "DispositionModal" }
+    ],
+
+    "composites": [
+      {
+        "invoke": "Given user performs \"login\"",
+        "evidence": ["features/auth/login.feature:3"]
+      },
+      {
+        "invoke": "Given user performs \"navigate to loan details\"",
+        "evidence": ["features/loans/check_loan.feature:5"]
+      }
+    ],
+
+    "last_mile": [
+      {
+        "schema": "yourorg.last-mile",
+        "version": "1.0.0",
+        "from": "LoanDetailsPage",
+        "to": "DispositionModal",
+        "intent": "open-modal",
+        "mode": "probe",
+        "candidates": [
+          {
+            "kind": "control",
+            "hint": "disposition.dropdown",
+            "locator": { "orKey": "disposition.dropdown" }
+          },
+          { "kind": "text", "hint": "Disposition" }
+        ],
+        "assert": {
+          "page": "DispositionModal",
+          "orFallback": { "text": "Disposition", "timeoutMs": 7000 }
+        },
+        "data": {
+          "disposition_code": "<APPROVE|DECLINE|REVIEW>",
+          "reason": "<short_reason>"
+        },
+        "examples": [
+          { "disposition_code": "APPROVE", "reason": "Customer eligible" },
+          { "disposition_code": "DECLINE", "reason": "Debt-to-income high" }
+        ],
+
+        "derivedManual": {
+          "bullets": [
+            "Open Disposition",
+            "Select <disposition_code>",
+            "Validate modal visible"
+          ]
+        },
+
+        "baseStepMapping": [
+          {
+            "manual": "Open Disposition",
+            "intent": "nav.click",
+            "targetHint": "disposition.dropdown",
+            "candidates": [
+              {
+                "baseStepText": "Then user clicks \"{control}\"",
+                "params": ["control"],
+                "binding": { "control": "disposition.dropdown" },
+                "confidence": 0.92,
+                "evidence": ["features/common/clicks.feature:6"]
+              }
+            ]
+          },
+          {
+            "manual": "Select <disposition_code>",
+            "intent": "nav.select",
+            "targetHint": "disposition.dropdown",
+            "candidates": [
+              {
+                "baseStepText": "Then user selects \"{value}\" in \"{control}\"",
+                "params": ["value", "control"],
+                "binding": {
+                  "value": "<disposition_code>",
+                  "control": "disposition.dropdown"
+                },
+                "confidence": 0.95,
+                "evidence": ["features/common/select.feature:8"]
+              }
+            ]
+          },
+          {
+            "manual": "Validate modal visible",
+            "intent": "assert.visible",
+            "targetHint": "DispositionModal",
+            "candidates": [
+              {
+                "baseStepText": "Then user validates \"{page}\" page",
+                "params": ["page"],
+                "binding": { "page": "DispositionModal" },
+                "confidence": 0.88,
+                "evidence": ["features/common/validate_page.feature:4"]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+
+    "validations": [
+      {
+        "type": "ui.banner",
+        "textContains": "Disposition saved",
+        "severity": "must"
+      },
+      {
+        "type": "db.check",
+        "table": "LOAN",
+        "where": { "loanId": "<loan_id>" },
+        "expect": { "disposition": "<disposition_code>" },
+        "severity": "should"
+      }
+    ],
+
+    "dataBindings": { "role": "backoffice", "loan_id": "<existing_loan_id>" }
+  }
+}
