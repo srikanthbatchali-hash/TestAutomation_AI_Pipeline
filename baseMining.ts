@@ -1,502 +1,341 @@
-// src/miners/baseMining.ts
+// src/base/mining.ts
 import * as vscode from "vscode";
+import * as path from "path";
 import { TextDecoder, TextEncoder } from "util";
-import { createHash } from "crypto";
-import {
-  // Lite types we build internally here
-  BaseScenariosIndex,
-  ScenarioDef,
-  ScenarioCallsIndex,
-  ScenarioCall,
-  BaseStepsCatalog,
-  BaseStepPattern,
-  ArgSlotStats,
-} from "./types";
+import { findFeatureFiles } from "../utils/findFeatureFiles";
+
+export type StepDef = { keyword: string; text: string; line: number };
+export type ScenarioDef = {
+  id: string; // file:line
+  file: string; // relative path
+  name: string; // raw scenario name (may include <placeholders>)
+  type: "Scenario" | "Scenario Outline";
+  tags: string[];
+  rawSteps: StepDef[];
+  examplesHeader?: string[]; // header cells (if Outline)
+  examplesSample?: string[][]; // first few example rows
+  nameExpansions?: string[]; // scenario name expanded using sample rows
+  referencedBy?: string[]; // filled in 2nd pass
+};
+
+export type BaseScenariosIndex = {
+  version: "1.1";
+  generatedAt: string;
+  totalScenarios: number;
+  baseCount: number;
+  nonBaseCount: number;
+  baseScenarios: Array<{
+    name: string; // canonical display name
+    definitions: ScenarioDef[]; // de-duped unique defs (by id/content)
+  }>;
+};
+
+const CALL_RE =
+  /^\s*(Given|When|Then|And|But)\s+user\s+(performs|calls|executes|runs|invokes)\s+["'“”]?([^"'“”]+|<[^>]+>)["'“”]?/i;
 
 const dec = new TextDecoder("utf-8");
 const enc = new TextEncoder();
+const stopSpaces = (s: string) => s.replace(/\s+/g, " ").trim();
+const norm = (s: string) => stopSpaces(s.toLowerCase());
 
-/* =======================================================================
-   PUBLIC ENTRYPOINT
-   ======================================================================= */
+/** Parse a single .feature file into ScenarioDef[] (lightweight Gherkin parser). */
+async function parseFeatureFile(
+  uri: vscode.Uri,
+  wsRoot: vscode.Uri
+): Promise<ScenarioDef[]> {
+  const rel = path.normalize(path.relative(wsRoot.fsPath, uri.fsPath));
+  const txt = dec.decode(await vscode.workspace.fs.readFile(uri));
+  const lines = txt.split(/\r?\n/);
 
-export async function buildAndSaveBaseArtifacts(opts?: {
-  glob?: string;
-  outDir?: string;
-  previewTemplateLimit?: number; // kept for compatibility (not used now)
-  samplePerPattern?: number; // examples/provenance per pattern (default 6)
-  minPatternCount?: number; // prune rare patterns (< count)
-}): Promise<{
-  baseScenarios: BaseScenariosIndex;
-  scenarioCalls: ScenarioCallsIndex;
-  baseSteps: BaseStepsCatalog;
-}> {
-  const glob = opts?.glob ?? "**/*.feature";
-  const outDir = opts?.outDir ?? ".qa-cache";
-  const samplePerPattern = Math.max(1, opts?.samplePerPattern ?? 6);
-  const minPatternCount = Math.max(1, opts?.minPatternCount ?? 1);
+  const scenarios: ScenarioDef[] = [];
+  let pendingTags: string[] = [];
+  let cur: ScenarioDef | null = null;
+  let inExamples = false;
+  let examplesHeader: string[] | undefined;
+  let examplesRows: string[][] = [];
 
-  // 1) Lite scan of all feature files
-  const lite = await scanWorkspaceLite(glob);
-
-  // 2) Build ledgers (order-independent defs & calls)
-  const { defsByName, callsByName } = buildLedgers(lite);
-
-  // 3) Resolve callers → candidates
-  const scenarioCalls = resolveScenarioCalls(defsByName, callsByName);
-
-  // 4) Build Base Scenarios Registry (with raw steps + expansions)
-  const baseScenarios = buildBaseScenariosIndex(defsByName, scenarioCalls);
-
-  // 5) Build Base Steps Catalog (canonical templates + arg stats)
-  const baseSteps = buildBaseStepsCatalog(lite, {
-    samplePerPattern,
-    minPatternCount,
-  });
-
-  // 6) Save artifacts
-  await saveJson(outDir, "scenario-calls.index.json", scenarioCalls);
-  await saveJson(outDir, "base-scenarios.index.json", baseScenarios);
-  await saveJson(outDir, "base-steps.catalog.json", baseSteps);
-
-  return { baseScenarios, scenarioCalls, baseSteps };
-}
-
-/* =======================================================================
-   LITE PARSER
-   ======================================================================= */
-
-type LiteStep = {
-  keyword: "Given" | "When" | "Then" | "And" | "But";
-  text: string;
-  line: number;
-};
-type LiteScenarioEx = {
-  id: string;
-  file: string;
-  line: number;
-  name: string;
-  type: "Scenario" | "Scenario Outline";
-  tags: string[];
-  steps: LiteStep[];
-  examplesHeader: string[];
-  examplesRows: Record<string, string>[]; // small sample
-};
-
-async function scanWorkspaceLite(glob: string): Promise<LiteScenarioEx[]> {
-  const files = await vscode.workspace.findFiles(
-    glob,
-    "**/node_modules/**",
-    50000
-  );
-  const out: LiteScenarioEx[] = [];
-  for (const f of files) {
-    const rel = vscode.workspace.asRelativePath(f);
-    const txt = dec.decode(await vscode.workspace.fs.readFile(f));
-    out.push(...parseFeatureLite(txt, rel));
-  }
-  return out;
-}
-
-function parseFeatureLite(text: string, relPath: string): LiteScenarioEx[] {
-  const lines = text.split(/\r?\n/);
-  const scenarios: LiteScenarioEx[] = [];
-
-  let tags: string[] = [];
-  let current: LiteScenarioEx | null = null;
-
-  const flush = () => {
-    if (current) scenarios.push(current);
-    current = null;
-    tags = [];
+  const flushScenario = () => {
+    if (!cur) return;
+    // attach examples if any
+    if (
+      cur.type === "Scenario Outline" &&
+      examplesHeader &&
+      examplesRows.length
+    ) {
+      cur.examplesHeader = examplesHeader;
+      cur.examplesSample = examplesRows.slice(0, 3);
+      // produce a few expanded names for matching
+      const expansions: string[] = [];
+      for (const row of cur.examplesSample) {
+        let name = cur.name;
+        for (let i = 0; i < examplesHeader.length && i < row.length; i++) {
+          const key = examplesHeader[i];
+          const val = row[i];
+          name = name.replace(
+            new RegExp(`<\\s*${escapeReg(key)}\\s*>`, "gi"),
+            val
+          );
+        }
+        expansions.push(stopSpaces(name));
+      }
+      cur.nameExpansions = Array.from(new Set(expansions));
+    }
+    scenarios.push(cur);
+    // reset examples area
+    inExamples = false;
+    examplesHeader = undefined;
+    examplesRows = [];
+    cur = null;
   };
 
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i];
-    const line = raw.trimEnd();
-    const n = i + 1;
+    const line = raw.trim();
 
-    if (/^\s*#/.test(line)) continue;
-    if (/^\s*@/.test(line)) {
-      tags = line.split(/\s+/).filter((t) => t.startsWith("@"));
+    // tag lines
+    if (line.startsWith("@")) {
+      pendingTags = line.split(/\s+/).filter(Boolean);
       continue;
     }
 
-    const scen = line.match(/^\s*(Scenario Outline|Scenario)\s*:\s*(.+)$/i);
-    if (scen) {
-      flush();
-      const type: LiteScenarioEx["type"] = scen[1]
-        .toLowerCase()
-        .includes("outline")
+    // Scenario / Scenario Outline
+    const scenMatch = line.match(/^(Scenario Outline|Scenario):\s*(.+)$/i);
+    if (scenMatch) {
+      // end previous
+      if (cur) flushScenario();
+
+      const type = scenMatch[1].toLowerCase().startsWith("scenario outline")
         ? "Scenario Outline"
         : "Scenario";
-      current = {
-        id: `${relPath}:${n}`,
-        file: relPath,
-        line: n,
-        name: scen[2].trim(),
+      const name = stopSpaces(scenMatch[2]);
+      cur = {
+        id: `${rel}:${i + 1}`,
+        file: rel,
+        name,
         type,
-        tags: tags.slice(),
-        steps: [],
-        examplesHeader: [],
-        examplesRows: [],
+        tags: pendingTags.slice(),
+        rawSteps: [],
       };
+      pendingTags = [];
+      inExamples = false;
       continue;
     }
 
-    if (!current) continue;
+    // Examples:
+    if (/^Examples:/i.test(line)) {
+      inExamples = true;
+      examplesHeader = undefined;
+      examplesRows = [];
+      continue;
+    }
 
-    const step = line.match(/^\s*(Given|When|Then|And|But)\s+(.*)$/i);
-    if (step) {
-      current.steps.push({
-        keyword: step[1] as LiteStep["keyword"],
-        text: step[2].trim(),
-        line: n,
+    // Examples table rows
+    if (inExamples && /^\|/.test(line)) {
+      const cells = line
+        .split("|")
+        .slice(1, -1)
+        .map((c) => stopSpaces(c));
+      if (!examplesHeader) {
+        examplesHeader = cells;
+      } else if (cells.length) {
+        examplesRows.push(cells);
+      }
+      continue;
+    }
+
+    // Steps
+    const stepMatch = line.match(/^(Given|When|Then|And|But)\s+(.+)$/i);
+    if (stepMatch && cur) {
+      cur.rawSteps.push({
+        keyword: stepMatch[1],
+        text: stopSpaces(stepMatch[2]),
+        line: i + 1,
       });
       continue;
     }
 
-    if (/^\s*Examples\s*:/i.test(line)) {
-      let j = i + 1;
-      if (j < lines.length && /^\s*@/.test(lines[j])) j++; // skip example-level tags
-      const head = readRow(lines[j]);
-      if (!head) {
-        i = j;
-        continue;
-      }
-      current.examplesHeader = head;
-      j++;
-      for (let k = 0; k < 5; k++) {
-        // sample first 5 rows max
-        const row = readRow(lines[j]);
-        if (!row) break;
-        const rec: Record<string, string> = {};
-        head.forEach((h, idx) => (rec[h] = (row[idx] ?? "").trim()));
-        current.examplesRows.push(rec);
-        j++;
-      }
-      i = j - 1;
+    // Blank or comments reset pending tags
+    if (!line || line.startsWith("#")) {
+      pendingTags = pendingTags; // no-op, keep until next scenario
       continue;
     }
   }
-  flush();
+  if (cur) flushScenario();
   return scenarios;
 }
 
-function readRow(line?: string): string[] | null {
-  if (!line) return null;
-  const m = line.match(/^\s*\|(.+)\|\s*$/);
-  if (!m) return null;
-  return m[1].split("|").map((c) => c.trim());
+/** Escape regex meta for dynamic placeholders */
+function escapeReg(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/* =======================================================================
-   LEDGERS (ORDER-INDEPENDENT) & RESOLUTION
-   ======================================================================= */
-
-type DefsLedger = Map<string /* lowerName */, ScenarioDef[]>;
-type CallsLedger = Map<string /* lowerName */, ScenarioCall[]>;
-
-function buildLedgers(all: LiteScenarioEx[]) {
-  const defsByName: DefsLedger = new Map();
-  const callsByName: CallsLedger = new Map();
-
-  for (const s of all) {
-    const lowerName = s.name.trim().toLowerCase();
-
-    // Expanded names from Examples (for display/search)
-    const nameExpansions: string[] = [];
-    if (
-      s.type === "Scenario Outline" &&
-      s.examplesHeader.length > 0 &&
-      s.examplesRows.length > 0
-    ) {
-      for (let i = 0; i < Math.min(5, s.examplesRows.length); i++) {
-        nameExpansions.push(bindAngles(s.name, s.examplesRows[i]));
-      }
-    }
-
-    // Scenario definition with ORIGINAL steps (no normalization)
-    const def: ScenarioDef = {
-      id: s.id,
-      file: s.file,
-      type: s.type,
-      tags: s.tags,
-      rawSteps: s.steps.map((st) => ({
-        keyword: st.keyword,
-        text: st.text,
-        line: st.line,
-      })),
-      examplesHeader: s.examplesHeader,
-      examplesSample: s.examplesRows,
-      nameExpansions,
-      referencedBy: [],
-    };
-
-    const arr = defsByName.get(lowerName) ?? [];
-    arr.push(def);
-    defsByName.set(lowerName, arr);
-
-    // Collect composite invocations from original lines
-    for (const st of s.steps) {
-      const callee = detectCompositeCall(`${st.keyword} ${st.text}`);
-      if (callee) {
-        const call: ScenarioCall = {
-          caller: { name: s.name, id: s.id, file: s.file },
-          calleeName: callee,
-          stepLine: st.line,
-          candidates: [],
-          evidence: `${s.file}:${st.line}`,
-        };
-        const bucket = callsByName.get(callee.toLowerCase()) ?? [];
-        bucket.push(call);
-        callsByName.set(callee.toLowerCase(), bucket);
-      }
+/** Build name→defs index including expansions */
+function buildNameIndex(defs: ScenarioDef[]) {
+  const byName = new Map<string, ScenarioDef[]>();
+  for (const d of defs) {
+    const names = [d.name, ...(d.nameExpansions ?? [])]
+      .map(norm)
+      .filter((x) => x.length > 0);
+    const uniq = Array.from(new Set(names));
+    for (const n of uniq) {
+      if (!byName.has(n)) byName.set(n, []);
+      byName.get(n)!.push(d);
     }
   }
-  return { defsByName, callsByName };
+  return byName;
 }
 
-function resolveScenarioCalls(
-  defsByName: DefsLedger,
-  callsByName: CallsLedger
-): ScenarioCallsIndex {
-  const callsOut: ScenarioCall[] = [];
-  for (const [calleeLower, calls] of callsByName.entries()) {
-    const defs = defsByName.get(calleeLower) ?? [];
-    for (const call of calls) {
-      call.candidates = defs.map((d) => ({
-        name: call.calleeName,
-        id: d.id,
-        file: d.file,
-      }));
-      callsOut.push(call);
-    }
+/** Extract composite calls from a scenario's steps */
+function extractCalls(steps: StepDef[]): string[] {
+  const out: string[] = [];
+  for (const s of steps) {
+    const m = s.text.match(CALL_RE);
+    if (!m) continue;
+    const raw = m[3].trim();
+    // strip surrounding angle brackets if present
+    const cleaned = raw.replace(/^<\s*|\s*>$/g, "");
+    out.push(norm(cleaned));
   }
-  return {
-    version: "1.0",
-    generatedAt: new Date().toISOString(),
-    calls: callsOut,
-  };
+  return out;
 }
 
-function buildBaseScenariosIndex(
-  defsByName: DefsLedger,
-  callsIdx: ScenarioCallsIndex
-): BaseScenariosIndex {
-  // Aggregate reverse references
-  const refsById = new Map<string, Set<string>>();
-  for (const c of callsIdx.calls) {
-    for (const cand of c.candidates) {
-      const set = refsById.get(cand.id) ?? new Set<string>();
-      set.add(c.caller.id);
-      refsById.set(cand.id, set);
-    }
-  }
-
-  const baseScenarios: BaseScenariosIndex["baseScenarios"] = [];
-  const ambiguous: BaseScenariosIndex["ambiguous"] = [];
-
-  for (const [lowerName, defs] of defsByName.entries()) {
-    // Prefer a cleaned display name (first expansion) if available
-    const displayName =
-      defs.find((d) => (d.nameExpansions?.length ?? 0) > 0)
-        ?.nameExpansions![0] ?? lowerName;
-
-    const enriched = defs.map((d) => ({
-      ...d,
-      referencedBy: Array.from(refsById.get(d.id) ?? []),
-    }));
-
-    baseScenarios.push({ name: displayName, definitions: enriched });
-
-    if (defs.length > 1) {
-      ambiguous.push({
-        calleeName: displayName,
-        definitions: defs.map((d) => d.id),
-      });
-    }
-  }
-
-  return {
-    version: "1.0",
-    generatedAt: new Date().toISOString(),
-    baseScenarios,
-    ambiguous,
-  };
-}
-
-function bindAngles(text: string, row: Record<string, string>): string {
-  return text.replace(/<([^>]+)>/g, (_, k) => row[k] ?? `<${k}>`);
-}
-
-/* =======================================================================
-   BASE STEPS CATALOG (CANONICAL)
-   ======================================================================= */
-
-function buildBaseStepsCatalog(
-  all: LiteScenarioEx[],
-  opts: { samplePerPattern: number; minPatternCount: number }
-): BaseStepsCatalog {
-  const buckets = new Map<string /* signature */, BaseStepPattern>();
-
-  for (const s of all) {
-    for (const st of s.steps) {
-      const templ = normalizeTemplateToArgs(`${st.keyword} ${st.text}`);
-      const sig = sha1(templ.toLowerCase());
-
-      let pat = buckets.get(sig);
-      if (!pat) {
-        pat = {
-          signature: sig,
-          template: templ,
-          count: 0,
-          argSchema: buildEmptyArgSchema(templ),
-          provenance: [],
-          lastSeen: nowIso(),
-        };
-        buckets.set(sig, pat);
-      }
-      pat.count++;
-      if (pat.provenance.length < opts.samplePerPattern) {
-        pat.provenance.push(s.id);
-      }
-      pat.lastSeen = nowIso();
-
-      // update arg stats from this raw step instance
-      updateArgStatsFromStep(pat.argSchema, `${st.keyword} ${st.text}`);
-
-      // light verb tag (optional)
-      if (!pat.tags) pat.tags = [];
-      const verb = (
-        templ.match(/^\s*(Given|When|Then|And|But)\s+(\w+)/i)?.[2] || ""
-      ).toLowerCase();
-      if (verb && !pat.tags.includes(verb)) pat.tags.push(verb);
-    }
-  }
-
-  // prune rare patterns if configured
-  const patterns = Array.from(buckets.values()).filter(
-    (p) => p.count >= opts.minPatternCount
-  );
-
-  return { version: "1.0", generatedAt: nowIso(), patterns };
-}
-
-function buildEmptyArgSchema(template: string): ArgSlotStats[] {
-  const slots = Array.from(template.matchAll(/\{arg(\d+)\}/g)).map(
-    (m) => `arg${m[1]}`
-  );
-  return slots.map((s) => ({ slot: s, examples: [] }));
-}
-
-function updateArgStatsFromStep(schema: ArgSlotStats[], rawStep: string) {
-  const quoted = Array.from(rawStep.matchAll(/"([^"]*)"/g)).map((m) => m[1]);
-  schema.forEach((slot, idx) => {
-    const val = quoted[idx];
-    if (typeof val !== "string") return;
-
-    // examples (cap at 10; reservoir-ish replacement)
-    if (!slot.examples.includes(val)) {
-      if (slot.examples.length < 10) slot.examples.push(val);
-      else if (Math.random() < 0.1)
-        slot.examples[Math.floor(Math.random() * slot.examples.length)] = val;
-    }
-
-    // length stats
-    const L = val.length;
-    if (!slot.len) slot.len = { min: L, max: L };
-    else {
-      slot.len.min = Math.min(slot.len.min, L);
-      slot.len.max = Math.max(slot.len.max, L);
-    }
-
-    // type guesses
-    const g = new Set(slot.typeGuess ?? []);
-    if (/^\d{4}-\d{2}-\d{2}$/.test(val)) g.add("date");
-    if (/^(true|false|yes|no)$/i.test(val)) g.add("boolean");
-    if (/^\d+$/.test(val)) g.add("int");
-    slot.typeGuess = Array.from(g);
-
-    // regex candidates
-    if (/^\d{4}-\d{2}-\d{2}$/.test(val)) {
-      slot.regex = Array.from(
-        new Set([...(slot.regex ?? []), "^\\d{4}-\\d{2}-\\d{2}$"])
-      );
-    }
+/** Dedupe by id, then by content (merge referencedBy) */
+function contentKey(d: ScenarioDef): string {
+  return JSON.stringify({
+    type: d.type,
+    steps: d.rawSteps.map((s) => `${s.keyword} ${s.text}`),
+    examplesHeader: d.examplesHeader ?? [],
+    examplesSample: (d.examplesSample ?? []).slice(0, 3),
   });
 }
 
-/* =======================================================================
-   COMPOSITE CALL DETECTION
-   ======================================================================= */
-
-let COMPOSITE_CALL_RES: RegExp[] | null = null;
-
-function detectCompositeCall(stepLine: string): string | null {
-  const regs = COMPOSITE_CALL_RES ?? DEFAULT_CALLS;
-  for (const re of regs) {
-    const m = stepLine.match(re);
-    if (m) return (m[2] ?? m[3])?.trim() ?? null;
+function dedupeScenarioDefs(defs: ScenarioDef[]): ScenarioDef[] {
+  // by id
+  const byId = new Map<string, ScenarioDef>();
+  for (const d of defs) {
+    if (!byId.has(d.id)) byId.set(d.id, d);
   }
-  return null;
-}
-
-// Optional: load from .qa-config/composite-calls.regex.json (call once at extension startup if desired)
-export async function loadCompositeCallRegexesFromConfig() {
-  try {
-    const ws = vscode.workspace.workspaceFolders?.[0]?.uri;
-    if (!ws) return;
-    const uri = vscode.Uri.joinPath(
-      ws,
-      ".qa-config",
-      "composite-calls.regex.json"
-    );
-    const buf = await vscode.workspace.fs.readFile(uri);
-    const arr = JSON.parse(dec.decode(buf)) as string[];
-    COMPOSITE_CALL_RES = arr.map((s) => new RegExp(s, "i"));
-  } catch {
-    COMPOSITE_CALL_RES = DEFAULT_CALLS;
+  // by content
+  const byContent = new Map<string, ScenarioDef>();
+  for (const d of byId.values()) {
+    const key = contentKey(d);
+    const existing = byContent.get(key);
+    if (!existing) {
+      byContent.set(key, d);
+    } else {
+      const a = new Set(existing.referencedBy ?? []);
+      for (const r of d.referencedBy ?? []) a.add(r);
+      existing.referencedBy = Array.from(a);
+    }
   }
+  return Array.from(byContent.values());
 }
 
-const DEFAULT_CALLS: RegExp[] = [
-  /^\s*(Given|When|Then|And|But)\s+user\s+performs\s+"([^"]+)"\s*$/i,
-  /^\s*(Given|When|Then|And|But)\s+user\s+(executes|runs|invokes)\s+"([^"]+)"\s*$/i,
-];
+/** Populate referencedBy (callee <- caller ids) in a second pass */
+function populateReferences(defs: ScenarioDef[]): Map<string, string[]> {
+  const byName = buildNameIndex(defs);
+  const refs = new Map<string, string[]>();
 
-/* =======================================================================
-   NORMALIZATION FOR BASE-STEP TEMPLATES
-   ======================================================================= */
-
-function normalizeTemplateToArgs(stepLine: string): string {
-  let i = 1;
-  return stepLine
-    .replace(/"([^"]*)"/g, () => `"${"{" + "arg" + i++ + "}"}"`)
-    .replace(/\s+/g, " ")
-    .trim();
+  for (const caller of defs) {
+    const calls = extractCalls(caller.rawSteps);
+    for (const cname of calls) {
+      const cands = byName.get(cname);
+      if (!cands || cands.length === 0) continue;
+      for (const callee of cands) {
+        if (!refs.has(callee.id)) refs.set(callee.id, []);
+        refs.get(callee.id)!.push(caller.id);
+      }
+    }
+  }
+  // de-duplicate callers
+  for (const [id, arr] of refs) {
+    refs.set(id, Array.from(new Set(arr)));
+  }
+  return refs;
 }
 
-/* =======================================================================
-   IO HELPERS
-   ======================================================================= */
-
-async function saveJson(outDir: string, fileName: string, obj: any) {
-  const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-  if (!root) throw new Error("No workspace open");
-  const dir = vscode.Uri.joinPath(root, outDir);
+/** Writes JSON to .qa-cache/<name> */
+async function writeCache(name: string, obj: any) {
+  const ws = vscode.workspace.workspaceFolders?.[0]?.uri;
+  if (!ws) throw new Error("No workspace open.");
+  const dir = vscode.Uri.joinPath(ws, ".qa-cache");
   await vscode.workspace.fs.createDirectory(dir);
-  const uri = vscode.Uri.joinPath(dir, fileName);
-  await vscode.workspace.fs.writeFile(
-    uri,
-    enc.encode(JSON.stringify(obj, null, 2))
-  );
+  const file = vscode.Uri.joinPath(dir, name);
+  const data = enc.encode(JSON.stringify(obj, null, 2));
+  await vscode.workspace.fs.writeFile(file, data);
 }
 
-function sha1(s: string): string {
-  return createHash("sha1").update(s).digest("hex");
-}
+/** Main: parse, link, filter to referenced (base), write index */
+export async function buildAndSaveBaseArtifacts(): Promise<{
+  baseIndex: BaseScenariosIndex;
+  nonBase: ScenarioDef[];
+}> {
+  const ws = vscode.workspace.workspaceFolders?.[0]?.uri;
+  if (!ws) throw new Error("No workspace folder open.");
 
-function nowIso() {
-  return new Date().toISOString();
+  // 1) Find .feature files (excludes target/, dist/, etc.)
+  const uris = await findFeatureFiles();
+
+  // 2) Parse all scenarios
+  const allDefs: ScenarioDef[] = [];
+  for (const u of uris) {
+    try {
+      const defs = await parseFeatureFile(u, ws);
+      allDefs.push(...defs);
+    } catch (e) {
+      console.warn(`Failed to parse ${u.fsPath}:`, e);
+    }
+  }
+
+  // 3) Populate references in a second pass
+  const refs = populateReferences(allDefs);
+  for (const d of allDefs) {
+    d.referencedBy = refs.get(d.id) ?? [];
+  }
+
+  // 4) Filter to only referenced scenarios (strict base policy)
+  const baseOnly = allDefs.filter((d) => (d.referencedBy?.length ?? 0) > 0);
+
+  // 5) Group by name and de-duplicate definitions
+  const byName = new Map<string, ScenarioDef[]>();
+  for (const d of baseOnly) {
+    const key = norm(d.name);
+    if (!byName.has(key)) byName.set(key, []);
+    byName.get(key)!.push(d);
+  }
+
+  const baseScenarios: BaseScenariosIndex["baseScenarios"] = [];
+  for (const [lowerName, defs] of byName) {
+    const unique = dedupeScenarioDefs(defs);
+    const displayName = unique[0]?.name ?? lowerName;
+    baseScenarios.push({ name: displayName, definitions: unique });
+  }
+
+  // 6) Sort for stable output
+  baseScenarios.sort((a, b) => a.name.localeCompare(b.name));
+
+  // 7) Build index & write
+  const baseIndex: BaseScenariosIndex = {
+    version: "1.1",
+    generatedAt: new Date().toISOString(),
+    totalScenarios: allDefs.length,
+    baseCount: baseOnly.length,
+    nonBaseCount: allDefs.length - baseOnly.length,
+    baseScenarios,
+  };
+
+  await writeCache("base-scenarios.index.json", baseIndex);
+
+  // Optional diagnostics: who got excluded (top 100 by “base-looking” name)
+  const nonBase = allDefs.filter((d) => (d.referencedBy?.length ?? 0) === 0);
+  const diag = {
+    totalCandidates: nonBase.length,
+    note: "These scenarios are not referenced by any other scenario. They were excluded from base index.",
+    samples: nonBase
+      .slice(0, 100)
+      .map(({ id, file, name, tags }) => ({ id, file, name, tags })),
+  };
+  await writeCache("candidates.base.json", diag);
+
+  return { baseIndex, nonBase };
 }
