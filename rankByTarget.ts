@@ -1,21 +1,36 @@
 // src/routes/rankByTarget.ts
-import type { NavRegistry } from "../pagegraph/navRegistry";
-import type { OrIndex } from "../pagegraph/types";
+// Uses GraphShim instead of NavRegistry.distance, and supports OR where controls live under pages.
 import type { BaseScenariosIndex, ScenarioDef } from "../base/mining";
+import type { GraphShim } from "../pagegraph/graphShim";
 
-export type RankWeights = {
-  reach: number; // closer endNode→target gets more points
-  bind: number; // how many required controls already used
-  verbs: number; // overlap with required verbs
-  ac: number; // keyword overlap with Jira AC (optional)
-  freq: number; // how often this composite is called (popularity)
+export type OrIndex = {
+  appKey?: string;
+  pages: Record<
+    string,
+    {
+      // page id -> meta
+      controls?: Record<
+        string,
+        {
+          /* any */
+        }
+      >; // controlKey -> meta
+    }
+  >;
 };
 
+export type RankWeights = {
+  reach: number;
+  bind: number;
+  verbs: number;
+  ac: number;
+  freq: number;
+};
 export type LastMileSpec = {
-  targetNodes?: string[]; // chosen target(s)
-  requiredControls?: string[]; // OR keys implied by AC
-  requiredVerbs: string[]; // ["input","select","click","validate"]
-  keywords?: string[]; // Jira tokens for ac overlap
+  targetNodes?: string[];
+  requiredControls?: string[];
+  requiredVerbs: string[];
+  keywords?: string[];
 };
 
 export type RankedCandidate = {
@@ -23,7 +38,7 @@ export type RankedCandidate = {
   name: string;
   file: string;
   score: number;
-  distance: number; // hops to target (Infinity if unknown)
+  distance: number;
   endNode?: string | null;
   reasons: string[];
   caseLabel: "reuse" | "extend" | "explore";
@@ -37,12 +52,24 @@ const DEF_W: RankWeights = {
   freq: 0.1,
 };
 
+// Build a quick control->page index from page-scoped controls
+function buildControlToPage(orIndex: OrIndex): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const [pageId, page] of Object.entries(orIndex.pages || {})) {
+    const ctrls = page.controls || {};
+    for (const key of Object.keys(ctrls)) {
+      if (!map.has(key)) map.set(key, pageId);
+    }
+  }
+  return map;
+}
+
 export function rankBaseScenariosByTarget(
   baseIndex: BaseScenariosIndex,
-  nav: NavRegistry,
+  graph: GraphShim,
   orIndex: OrIndex,
   spec: LastMileSpec,
-  callGraph?: Map<string, number>, // scenario id -> how many callers (popularity)
+  callGraph?: Map<string, number>, // scenario id -> popularity
   weights: Partial<RankWeights> = {}
 ): RankedCandidate[] {
   const w = { ...DEF_W, ...weights };
@@ -52,41 +79,40 @@ export function rankBaseScenariosByTarget(
     (spec.requiredVerbs ?? []).map((v) => v.toLowerCase())
   );
   const acTokens = new Set((spec.keywords ?? []).map((k) => k.toLowerCase()));
+  const ctrl2page = buildControlToPage(orIndex);
 
   const out: RankedCandidate[] = [];
 
   for (const group of baseIndex.baseScenarios) {
     for (const d of group.definitions) {
-      // 1) Infer endNode
-      const endNode = inferEndNodeFromSteps(d, orIndex, nav);
+      // End node: page of the LAST referenced control (by appearance order)
+      const endNode = inferEndNodeFromSteps(d, ctrl2page);
 
-      // 2) Reach
-      let distance = Number.POSITIVE_INFINITY;
-      let reachScore = 0;
+      // Reach via shim
+      let distance = 99,
+        reachScore = 0;
       if (target && endNode) {
-        distance = nav.distance(endNode, target);
-        if (Number.isFinite(distance)) {
-          // map small distances to higher scores
-          reachScore = 1 / (1 + Math.max(0, distance));
-        }
+        distance = graph.distance(endNode, target);
+        reachScore = distance < 99 ? 1 / (1 + distance) : 0;
       }
 
-      // 3) Bind coverage: how many required controls already appear
-      const usedCtrls = controlsUsedInScenario(d, orIndex);
+      // Bind coverage: how many required controls are already present
+      const usedCtrls = controlsUsedInScenario(d, ctrl2page, true); // ordered list
+      const usedSet = new Set(usedCtrls);
       const bindCov = reqCtrls.size
-        ? [...reqCtrls].filter((c) => usedCtrls.has(c)).length / reqCtrls.size
+        ? [...reqCtrls].filter((c) => usedSet.has(c)).length / reqCtrls.size
         : 0;
 
-      // 4) Verb coverage
+      // Verb coverage: crude lexeme from each step
       const verbsUsed = verbsUsedInScenario(d);
       const verbCov = reqVerbs.size
         ? [...reqVerbs].filter((v) => verbsUsed.has(v)).length / reqVerbs.size
         : 0;
 
-      // 5) AC token overlap (with scenario name + step text)
+      // AC overlap: tokens found in name/steps
       const acCov = acOverlap(d, acTokens);
 
-      // 6) Popularity
+      // Popularity
       const freq = callGraph?.get(d.id) ?? 0;
       const freqScore = freq > 0 ? 1 - 1 / (1 + freq) : 0;
 
@@ -100,14 +126,12 @@ export function rankBaseScenariosByTarget(
       const caseLabel: RankedCandidate["caseLabel"] =
         target && endNode && distance === 0
           ? "reuse"
-          : target && Number.isFinite(distance)
+          : target && distance < 99
           ? "extend"
           : "explore";
 
       const reasons = [
-        target
-          ? `distance=${Number.isFinite(distance) ? distance : "∞"}`
-          : "no target",
+        target ? `distance=${distance < 99 ? distance : "∞"}` : "no target",
         reqCtrls.size
           ? `bind=${(bindCov * 100).toFixed(0)}% of ${reqCtrls.size}`
           : "no required controls",
@@ -125,7 +149,7 @@ export function rankBaseScenariosByTarget(
         name: group.name,
         file: d.file,
         score,
-        distance: Number.isFinite(distance) ? distance : 99,
+        distance,
         endNode,
         reasons,
         caseLabel,
@@ -141,29 +165,25 @@ export function rankBaseScenariosByTarget(
 
 function inferEndNodeFromSteps(
   d: ScenarioDef,
-  orIndex: OrIndex,
-  nav: NavRegistry
+  ctrl2page: Map<string, string>
 ): string | null {
-  // Heuristic: take the page of the LAST control used in the scenario.
-  const used = controlsUsedInScenario(d, orIndex, true /* keep order */);
+  const used = controlsUsedInScenario(d, ctrl2page, true);
   let last: string | undefined;
-  for (const ctrl of used as any as string[]) last = ctrl;
-  if (!last) return null;
-  const page = orIndex.controls[last]?.page;
-  return page ?? null;
+  for (const k of used) last = k;
+  return last ? ctrl2page.get(last) ?? null : null;
 }
 
 function controlsUsedInScenario(
   d: ScenarioDef,
-  orIndex: OrIndex,
+  ctrl2page: Map<string, string>,
   ordered = false
-): Set<string> | string[] {
+): string[] | Set<string> {
   const hits: string[] = [];
   for (const s of d.rawSteps) {
     const quoted = s.text.match(/"([^"]+)"/g) ?? [];
     for (const q of quoted) {
-      const k = q.slice(1, -1);
-      if (orIndex.controls[k]) hits.push(k);
+      const key = q.slice(1, -1);
+      if (ctrl2page.has(key)) hits.push(key);
     }
   }
   return ordered ? hits : new Set(hits);
@@ -173,7 +193,6 @@ function verbsUsedInScenario(d: ScenarioDef): Set<string> {
   const verbs = new Set<string>();
   for (const s of d.rawSteps) {
     const first = s.text.toLowerCase().split(/\s+/)[0];
-    // normalize And/But by previous keyword if needed; for now just take the lexeme
     verbs.add(first);
   }
   return verbs;
