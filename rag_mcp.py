@@ -1,97 +1,110 @@
-import asyncio, json, os, requests
-from mcp.server import Server
-from mcp.types import Tool, ToolRequest, ToolResponse, TextContent
+# pip install fastmcp requests
+import os
+import json
+import requests
+from typing import List, Optional
+from fastmcp import FastMCP, tool
 
-RAG_BASE = os.environ.get("RAG_BASE", "http://127.0.0.1:8091")  # points to hybrid_retrieval_api.py server
-MEM_URL  = os.environ.get("MEM_URL", "http://127.0.0.1:8080/memory/append")
-MEM_TOKEN= os.environ.get("MEM_TOKEN", "super-secret-token")
+# ------------ Config via ENV ------------
+RAG_BASE  = os.environ.get("RAG_BASE", "http://127.0.0.1:8091")  # retrieval.hybrid_retrieval_api server
+MEM_URL   = os.environ.get("MEM_URL",  "http://127.0.0.1:8080/memory/append")
+MEM_TOKEN = os.environ.get("MEM_TOKEN", "super-secret-token")
+TIMEOUT_S = float(os.environ.get("MCP_HTTP_TIMEOUT", "60"))
 
-server = Server("rag-tools")
+mcp = FastMCP("rag-tools")
 
-@server.list_tools()
-async def list_tools():
-    return [
-        Tool(
-            name="retrieve_hybrid",
-            description="Hybrid retrieve (TF-IDF→SVD vectors + BM25). Returns JSON with chunks.",
-            inputSchema={"type":"object","required":["q"],"properties":{
-                "q":{"type":"string"},
-                "app_name":{"type":"string","default":"claims"},
-                "top_k":{"type":"integer","default":8},
-                "pool":{"type":"integer","default":50}
-            }}
-        ),
-        Tool(
-            name="get_neighbors",
-            description="Fetch ±radius neighbor chunks from the same file.",
-            inputSchema={"type":"object","required":["source_path","seq_idx"],"properties":{
-                "app_name":{"type":"string","default":"claims"},
-                "source_path":{"type":"string"},
-                "seq_idx":{"type":"integer"},
-                "radius":{"type":"integer","default":1},
-                "limit":{"type":"integer","default":10}
-            }}
-        ),
-        Tool(
-            name="get_by_ids",
-            description="Fetch specific chunks by id list.",
-            inputSchema={"type":"object","required":["ids"],"properties":{
-                "app_name":{"type":"string","default":"claims"},
-                "ids":{"type":"array","items":{"type":"string"}}
-            }}
-        ),
-        Tool(
-            name="save_memory",
-            description="Append note/feedback/decision into Chroma via gateway.",
-            inputSchema={"type":"object","required":["collection","text","app"],"properties":{
-                "collection":{"type":"string"},
-                "text":{"type":"string"},
-                "app":{"type":"string"},
-                "module":{"type":"string"},
-                "submodule":{"type":"string"},
-                "flow":{"type":"string"},
-                "subflow":{"type":"string"},
-                "kind":{"type":"string","default":"note"},
-                "author":{"type":"string","default":"agent"}
-            }}
-        )
-    ]
+# ------------ Tools ------------
 
-@server.call_tool()
-async def call_tool(req: ToolRequest):
-    try:
-        if req.name == "retrieve_hybrid":
-            r = requests.get(f"{RAG_BASE}/retrieve", params=req.arguments or {}, timeout=60)
-            r.raise_for_status()
-            return ToolResponse(content=[TextContent(type="text", text=json.dumps(r.json(), ensure_ascii=False))])
+@tool(description="Hybrid retrieve (TF-IDF→SVD vectors + BM25 w/ RRF+MMR). Returns JSON string of chunks.")
+def retrieve_hybrid(
+    q: str,
+    app_name: str = "claims",
+    top_k: int = 8,
+    pool: int = 50
+) -> str:
+    """
+    Call the /retrieve API.
+    Returns: JSON string with fields {query, app, top_k, results:[{id,document,metadata}...]}
+    """
+    params = {"q": q, "app_name": app_name, "top_k": top_k, "pool": pool}
+    r = requests.get(f"{RAG_BASE}/retrieve", params=params, timeout=TIMEOUT_S)
+    r.raise_for_status()
+    return json.dumps(r.json(), ensure_ascii=False)
 
-        if req.name == "get_neighbors":
-            r = requests.get(f"{RAG_BASE}/neighbors", params=req.arguments or {}, timeout=30)
-            r.raise_for_status()
-            return ToolResponse(content=[TextContent(type="text", text=json.dumps(r.json(), ensure_ascii=False))])
+@tool(description="Fetch ±radius neighbor chunks from the same file. Returns JSON string.")
+def get_neighbors(
+    source_path: str,
+    seq_idx: int,
+    app_name: str = "claims",
+    radius: int = 1,
+    limit: int = 10
+) -> str:
+    """
+    Call the /neighbors API.
+    Returns: JSON string with {results:[{id,document,metadata}...]}
+    """
+    params = {
+        "app_name": app_name,
+        "source_path": source_path,
+        "seq_idx": seq_idx,
+        "radius": radius,
+        "limit": limit
+    }
+    r = requests.get(f"{RAG_BASE}/neighbors", params=params, timeout=TIMEOUT_S)
+    r.raise_for_status()
+    return json.dumps(r.json(), ensure_ascii=False)
 
-        if req.name == "get_by_ids":
-            args = req.arguments or {}
-            app_name = args.get("app_name","claims")
-            ids = args.get("ids",[])
-            r = requests.post(f"{RAG_BASE}/by_ids", params={"app_name": app_name}, json={"ids": ids}, timeout=30)
-            r.raise_for_status()
-            return ToolResponse(content=[TextContent(type="text", text=json.dumps(r.json(), ensure_ascii=False))])
+@tool(description="Fetch specific chunks by ids. Returns JSON string.")
+def get_by_ids(
+    ids: List[str],
+    app_name: str = "claims"
+) -> str:
+    """
+    Call the /by_ids API.
+    Returns: JSON string with {results:[{id,document,metadata}...]}
+    """
+    r = requests.post(
+        f"{RAG_BASE}/by_ids",
+        params={"app_name": app_name},
+        json={"ids": ids},
+        timeout=TIMEOUT_S,
+    )
+    r.raise_for_status()
+    return json.dumps(r.json(), ensure_ascii=False)
 
-        if req.name == "save_memory":
-            headers={"X-Token": MEM_TOKEN}
-            r = requests.post(MEM_URL, json=req.arguments or {}, headers=headers, timeout=30)
-            r.raise_for_status()
-            return ToolResponse(content=[TextContent(type="text", text=json.dumps(r.json(), ensure_ascii=False))])
+@tool(description="Append a note/feedback/decision to Chroma via memory gateway. Returns JSON string.")
+def save_memory(
+    collection: str,
+    text: str,
+    app: str,
+    module: Optional[str] = None,
+    submodule: Optional[str] = None,
+    flow: Optional[str] = None,
+    subflow: Optional[str] = None,
+    kind: str = "note",
+    author: str = "agent",
+) -> str:
+    """
+    Call the /memory/append API with header auth.
+    Returns: JSON string with {ok, id, note_id, ...}
+    """
+    headers = {"X-Token": MEM_TOKEN}
+    payload = {
+        "collection": collection,
+        "text": text,
+        "app": app,
+        "module": module,
+        "submodule": submodule,
+        "flow": flow,
+        "subflow": subflow,
+        "kind": kind,
+        "author": author,
+    }
+    r = requests.post(MEM_URL, json=payload, headers=headers, timeout=TIMEOUT_S)
+    r.raise_for_status()
+    return json.dumps(r.json(), ensure_ascii=False)
 
-        return ToolResponse(isError=True, content=[TextContent(type="text", text="Unknown tool")])
-    except Exception as e:
-        return ToolResponse(isError=True, content=[TextContent(type="text", text=f"Tool error: {e}")])
-
-
-def main():
-    from mcp.server.stdio import stdio_server
-    asyncio.run(stdio_server(server).serve())
-
+# ------------ Run (stdio) ------------
 if __name__ == "__main__":
-    main()
+    # This starts an MCP server over stdio, which VS Code / Copilot can attach to.
+    mcp.run()
