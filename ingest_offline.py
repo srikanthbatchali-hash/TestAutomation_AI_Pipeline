@@ -4,26 +4,25 @@
 #  - walks configured roots
 #  - parses .pdf/.docx/.txt/.md
 #  - structure-aware chunking
+#  - dedupes (exact + near-dup) with deterministic IDs h:<sha256>
 #  - embeds -> Chroma (batched)
-#  - builds Whoosh BM25 index per app
-#
-# Run:
-#   C:\chroma_stack\venv\Scripts\Activate.ps1
-#   python C:\chroma_stack\ingest\ingest_offline.py
+#  - emits JSONL per app for Pyserini indexing
+#  - optional Whoosh BM25 index (toggle in config.yaml)
 
 from __future__ import annotations
 import os
 import sys
-import uuid
+import re
 import json
-import math
 import time
+import math
+import uuid
 import pickle
+import hashlib
 import datetime as dt
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Iterable
+from typing import Dict, Any, List, Iterable
 
-# --- third-party ---
 import yaml
 import numpy as np
 import chromadb
@@ -34,19 +33,56 @@ from docx import Document
 # local helpers
 from hierarchy import derive_hierarchy
 from chunking import chunk_structured
-from whoosh_index import get_or_create, upsert
+
+# Optional Whoosh (can be disabled via config)
+try:
+    from whoosh_index import get_or_create, upsert  # our thin wrapper
+    WHOOSH_AVAILABLE = True
+except Exception:
+    WHOOSH_AVAILABLE = False
 
 # ------------ config / paths ------------
 BASE = Path(__file__).resolve().parents[1]
 CFG_PATH = BASE / "ingest" / "config.yaml"
 EMB_PATH = BASE / "models" / "tfidf_svd_384.pkl"
 WHOOSH_DIR = BASE / "data" / "whoosh"
+CORPUS_DIR = BASE / "pyserini_corpus"  # JSONL output for Pyserini
 
 # ------------ settings ------------
-BATCH_SIZE = 256            # safe for Chroma HTTP
-PREVIEW_CHARS = 600         # store short doc preview in Chroma 'documents'
-PDF_MAX_PAGES = 1500        # sanity guard
-SLEEP_BETWEEN_BATCHES = 0.05  # small breather for Chroma
+BATCH_SIZE = 256              # Chroma HTTP-safe batch size
+PREVIEW_CHARS = 600           # preview stored in Chroma 'documents'
+PDF_MAX_PAGES = 1500
+SLEEP_BETWEEN_BATCHES = 0.05  # small pause between Chroma batches
+
+# ------------ dedupe helpers ------------
+_ws = re.compile(r"\s+")
+_boiler = re.compile(r"(^\s*page\s+\d+\s*$)|(^\s*confidential\s*$)", re.I | re.M)
+
+def normalize_for_hash(text: str) -> str:
+    t = _boiler.sub(" ", text)
+    t = t.lower()
+    t = _ws.sub(" ", t).strip()
+    return t
+
+def chunk_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+def simhash(text: str, n=64) -> int:
+    tokens = [w for w in re.findall(r"\b[\w\-]+\b", text.lower()) if w]
+    if not tokens: return 0
+    v = [0]*n
+    for w in tokens:
+        h = int(hashlib.md5(w.encode("utf-8")).hexdigest(), 16)
+        for i in range(n):
+            v[i] += 1 if ((h >> i) & 1) else -1
+    out = 0
+    for i in range(n):
+        if v[i] >= 0:
+            out |= (1 << i)
+    return out
+
+def hamming(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
 
 # ------------ utils ------------
 def utc_now() -> str:
@@ -104,7 +140,6 @@ def load_docx_text(path: str) -> str:
 class Embedder:
     def __init__(self, pipe):
         self.pipe = pipe
-        # determine output dim by probing a tiny string
         probe = self._transform(["probe"])
         self.dim = int(probe.shape[1])
 
@@ -116,7 +151,6 @@ class Embedder:
 
     def embed_list(self, texts: List[str]) -> List[List[float]]:
         arr = self._transform(texts).astype(np.float32)
-        # L2 normalize (keeps cosine sane)
         norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-9
         arr = arr / norms
         return [row.tolist() for row in arr]
@@ -125,6 +159,17 @@ class Embedder:
 def batched(seq: List[Any], n: int) -> Iterable[List[Any]]:
     for i in range(0, len(seq), n):
         yield seq[i : i + n]
+
+# ------------ JSONL writers (Pyserini) ------------
+_jsonl_writers: Dict[str, Any] = {}
+
+def get_jsonl_writer(app: str):
+    if app not in _jsonl_writers:
+        pdir = CORPUS_DIR / f"{app}_jsonl"
+        pdir.mkdir(parents=True, exist_ok=True)
+        p = pdir / f"{app}.jsonl"
+        _jsonl_writers[app] = open(p, "a", encoding="utf-8")
+    return _jsonl_writers[app]
 
 # ------------ main ingest ------------
 def main():
@@ -141,7 +186,14 @@ def main():
     emb = Embedder(pipe)
     log(f"Embedder loaded. Output dim = {emb.dim}")
 
-    # 2) Chroma client
+    # 2) Toggle Whoosh
+    USE_WHOOSH = bool((cfg.get("whoosh") or {}).get("enabled", True) and WHOOSH_AVAILABLE)
+    if USE_WHOOSH:
+        WHOOSH_DIR.mkdir(parents=True, exist_ok=True)
+    else:
+        log("Whoosh indexing disabled (config or module unavailable).")
+
+    # 3) Chroma client
     client = chromadb.HttpClient(
         host=cfg["chroma"]["host"],
         port=int(cfg["chroma"]["port"]),
@@ -152,15 +204,22 @@ def main():
     include_exts = set(e.lower() for e in cfg["include_extensions"])
     max_bytes = int(cfg.get("max_mb", 25)) * 1024 * 1024
 
-    WHOOSH_DIR.mkdir(parents=True, exist_ok=True)
+    # Dedupe caches & counters (per run)
+    seen_hashes: set[str] = set()
+    seen_simhashes: List[int] = []
+    exact_dups_skipped = 0
+    near_dups_skipped = 0
+
     whoosh_ix_by_app = {}
 
-    def get_ix(app: str):
+    def ix_for(app: str):
+        if not USE_WHOOSH:
+            return None
         if app not in whoosh_ix_by_app:
             whoosh_ix_by_app[app] = get_or_create(WHOOSH_DIR / app)
         return whoosh_ix_by_app[app]
 
-    # 3) For each collection/app
+    # 4) For each collection/app
     for coll_cfg in cfg["collections"]:
         coll_name = coll_cfg["name"]
         app = coll_cfg["app"]
@@ -172,13 +231,12 @@ def main():
                 metadata={"embedder": "tfidf_svd_384", "hnsw:space": "cosine"},
             )
         except InvalidDimensionError as e:
-            # If a prior collection has a different dim, tell the user clearly.
             raise SystemExit(
                 f"Chroma collection '{coll_name}' has incompatible dimension. "
                 f"Delete it or recreate the DB. Details: {e}"
             )
 
-        ix = get_ix(app)
+        ix = ix_for(app)
         to_upsert_for_bm25: List[Dict[str, Any]] = []
 
         roots = [r for r in cfg["roots"] if r.get("app") == app]
@@ -214,20 +272,42 @@ def main():
                     if not chs:
                         continue
 
-                    # build per-file buffers
+                    # per-file buffers
                     ids: List[str] = []
                     docs: List[str] = []
                     metas: List[Dict[str, Any]] = []
                     payload_texts: List[str] = []
 
                     base_meta = derive_hierarchy(root, full)
+                    w_jsonl = get_jsonl_writer(app)
+
                     for ch in chs:
                         piece = (ch["body"] or "").strip()
                         if not piece:
                             continue
-                        ids.append(uuid.uuid4().hex)
+
+                        # dedupe
+                        norm = normalize_for_hash(piece)
+                        hid = chunk_sha256(norm)
+                        if hid in seen_hashes:
+                            exact_dups_skipped += 1
+                            continue
+
+                        sh = simhash(norm)
+                        if any(hamming(sh, prev) <= 3 for prev in seen_simhashes):
+                            near_dups_skipped += 1
+                            continue
+
+                        # mark seen
+                        seen_hashes.add(hid)
+                        seen_simhashes.append(sh)
+
+                        # deterministic ID
+                        cid = f"h:{hid}"
+
+                        ids.append(cid)
                         docs.append(piece[:PREVIEW_CHARS])
-                        m = {
+                        meta = {
                             **base_meta,
                             "kind": "doc",
                             "app": app,
@@ -235,14 +315,20 @@ def main():
                             "section_title": ch.get("title") or "",
                             "seq_idx": int(ch.get("seq_idx", 0)),
                             "ingested_at": utc_now(),
+                            "hash": hid,
+                            "simhash": sh
                         }
-                        metas.append(m)
+                        metas.append(meta)
                         payload_texts.append(piece)
+
+                        # JSONL for Pyserini
+                        rec = {"id": cid, "contents": piece, "raw": json.dumps(meta, ensure_ascii=False)}
+                        w_jsonl.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
                     if not ids:
                         continue
 
-                    # embed + upload in batches (to avoid HTTP body too large)
+                    # embed + upload to Chroma in batches
                     for b_ids, b_docs, b_metas, b_texts in zip(
                         batched(ids, BATCH_SIZE),
                         batched(docs, BATCH_SIZE),
@@ -250,9 +336,6 @@ def main():
                         batched(payload_texts, BATCH_SIZE),
                     ):
                         vecs = emb.embed_list(b_texts)
-                        # Sanity check: consistent dims
-                        if any(len(v) != emb.dim for v in vecs):
-                            raise RuntimeError("Embedding dimension mismatch within batch.")
                         coll.add(
                             ids=list(b_ids),
                             documents=list(b_docs),
@@ -261,34 +344,43 @@ def main():
                         )
                         time.sleep(SLEEP_BETWEEN_BATCHES)
 
-                    # stage BM25 upserts (raw text, not preview)
-                    for i, piece in enumerate(payload_texts):
-                        to_upsert_for_bm25.append(
-                            {
-                                "doc_id": ids[i],
-                                "app": app,
-                                "title": metas[i]["section_title"] or "",
-                                "text": piece,
-                                "source": full,
-                            }
-                        )
+                    # stage Whoosh upserts (raw text, not preview)
+                    if USE_WHOOSH:
+                        for i, piece in enumerate(payload_texts):
+                            to_upsert_for_bm25.append(
+                                {
+                                    "doc_id": ids[i],
+                                    "app": app,
+                                    "title": metas[i]["section_title"] or "",
+                                    "text": piece,
+                                    "source": full,
+                                }
+                            )
 
                     file_count += 1
                     chunk_count += len(ids)
                     log(f"    + {len(ids):4d} chunks   {full}")
 
-                    # periodic whoosh commits to keep memory bounded
-                    if len(to_upsert_for_bm25) >= 5000:
+                    # periodic Whoosh commits
+                    if USE_WHOOSH and len(to_upsert_for_bm25) >= 5000:
                         upsert(ix, to_upsert_for_bm25)
-                        log(f"  [BM25] committed {len(to_upsert_for_bm25)} docs")
+                        log(f"  [BM25/Whoosh] committed {len(to_upsert_for_bm25)} docs")
                         to_upsert_for_bm25.clear()
 
-        # final whoosh commit for this collection
-        if to_upsert_for_bm25:
+        # final Whoosh commit for this collection
+        if USE_WHOOSH and to_upsert_for_bm25:
             upsert(ix, to_upsert_for_bm25)
-            log(f"  [BM25] committed {len(to_upsert_for_bm25)} docs")
+            log(f"  [BM25/Whoosh] committed {len(to_upsert_for_bm25)} docs")
 
         log(f"=== done: files={file_count}, chunks={chunk_count} ===")
+
+    # dedupe summary
+    log(f"  [dedupe] exact_skipped={exact_dups_skipped} near_skipped={near_dups_skipped}")
+
+    # close JSONL writers
+    for fh in _jsonl_writers.values():
+        try: fh.close()
+        except: pass
 
     log("\nAll collections ingested successfully.")
 
